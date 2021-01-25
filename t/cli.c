@@ -76,6 +76,7 @@ typedef enum integration_test_t {
   T_SIMPLE_HANDSHAKE,
   T_ZERO_RTT_HANDSHAKE,
   T_PERF,
+  T_PERF_AGGREGATION,
   T_AGGREGATION,
   T_AGGREGATION_TIME /* same as aggregation, but timing to add a stream is controled by a timer rather than a number of bytes */
 } integration_test_t;
@@ -504,28 +505,29 @@ static int handle_server_perf_test(struct conn_to_tcpls *conn, fd_set
 }
 
 static int handle_server_multipath_test(list_t *conn_tcpls, integration_test_t test, int *inputfd, fd_set
-    *readset, fd_set *writeset) {
+    *readset, fd_set *writeset, ptls_buffer_t *recvbuf2, uint8_t *data, int datalen) {
   /** Now Read data for all tcpls_t * that wants to read */
   int ret = 1;
-  ptls_buffer_t recvbuf;
-  ptls_buffer_init(&recvbuf, "", 0);
   for (int i = 0; i < conn_tcpls->size; i++) {
     struct conn_to_tcpls *conn = list_get(conn_tcpls, i);
     if (FD_ISSET(conn->conn_fd, readset) && conn->state >= CONNECTED) {
-      ret = handle_tcpls_read(conn->tcpls, conn->conn_fd, &recvbuf);
+      recvbuf2->off = 0;
+      ret = handle_tcpls_read(conn->tcpls, conn->conn_fd, recvbuf2);
+      recvbuf2->off = 0;
       if (ret == -2) {
         fprintf(stderr, "Setting socket %d as primary\n", conn->conn_fd);
         conn->is_primary = 1;
         ret = 0;
-      }
-      if (ptls_handshake_is_complete(conn->tcpls->tls) && *inputfd > 0 &&
-          (conn->is_primary || ((test == T_AGGREGATION  || test ==
-                                 T_AGGREGATION_TIME) && conn->streamid)))
+      } 
+      if (ptls_handshake_is_complete(conn->tcpls->tls) && 
+            (conn->is_primary 
+               || ((test == T_AGGREGATION || test == T_AGGREGATION_TIME
+                    || test == T_PERF_AGGREGATION) 
+            && conn->streamid))) 
         conn->wants_to_write = 1;
-      break;
+      //break;
     }
   }
-  ptls_buffer_dispose(&recvbuf);
   /** Write data for all tcpls_t * that wants to write :-) */
   for (int i = 0; i < conn_tcpls->size; i++) {
     struct conn_to_tcpls *conn = list_get(conn_tcpls, i);
@@ -533,12 +535,16 @@ static int handle_server_multipath_test(list_t *conn_tcpls, integration_test_t t
      * juste before */
     if (FD_ISSET(conn->conn_fd, writeset) && conn->wants_to_write) {
       /** Figure out the stream to send data */
-      ret = handle_tcpls_write(conn->tcpls, conn, inputfd);
+      if((ret = tcpls_send(conn->tcpls->tls, conn->streamid, data, datalen)) != TCPLS_OK) {
+         if (ret == TCPLS_HOLD_DATA_TO_SEND) {
+           // 
+           ret = -2;
+         }
+       }
     }
   }
   return ret;
 }
-
 
 static int handle_client_perf_test(tcpls_t *tcpls, struct cli_data *data) {
   int ret;
@@ -590,6 +596,7 @@ Exit:
   ptls_buffer_dispose(&recvbuf);
   return ret;
 }
+
 static int handle_client_transfer_test(tcpls_t *tcpls, int test, struct cli_data *data) {
   /** handshake*/
   struct timeval t_init, t_now;
@@ -616,7 +623,6 @@ static int handle_client_transfer_test(tcpls_t *tcpls, int test, struct cli_data
   if (data->goodputfile) {
     outputfile = fopen(data->goodputfile, "a");
   }
-
 
   while (1) {
     /*cleanup*/
@@ -647,15 +653,20 @@ static int handle_client_transfer_test(tcpls_t *tcpls, int test, struct cli_data
     for (int i = 0; i < data->socklist->size; i++) {
       socket = list_get(data->socklist, i);
       if (FD_ISSET(*socket, &readfds)) {
+        recvbuf.off=0;
         if ((ret = handle_tcpls_read(tcpls, *socket, &recvbuf)) < 0) {
           fprintf(stderr, "handle_tcpls_read returned %d\n",ret);
           break;
         }
+        
+       if (test == T_PERF_AGGREGATION && has_multipath)
+            break;
         received_data += ret;
         if (received_data / 1000000 > mB_received) {
           mB_received++;
           printf("Received %d MB\n",mB_received);
         }
+
         if (outputfile && ret >= 0) {
           /** write infos on this received data */
           struct sockaddr_storage peer_sockaddr;
@@ -691,7 +702,8 @@ static int handle_client_transfer_test(tcpls_t *tcpls, int test, struct cli_data
       }
     }
     /** consume received data */
-    fwrite(recvbuf.base, recvbuf.off, 1, mtest);
+    //if (test != T_PERF_AGGREGATION)
+    //  fwrite(recvbuf.base, recvbuf.off, 1, mtest);
     recvbuf.off = 0;
 
     if (test == T_MULTIPATH && received_data >= 41457280  && !has_remigrated) {
@@ -740,9 +752,10 @@ static int handle_client_transfer_test(tcpls_t *tcpls, int test, struct cli_data
     gettimeofday(&t_now, NULL);
     struct timeval diff = timediff(&t_now, &t_init);
     /** We test a migration */
-    if ((received_data >= 21457280 && ((test == T_MULTIPATH && !has_migrated) ||
-            (test == T_AGGREGATION && !has_multipath))) || (test ==
-            T_AGGREGATION_TIME && !has_multipath && diff.tv_sec >= 5)) {
+    if ((test == T_PERF_AGGREGATION && received_data >= 21457280 && !has_multipath) || (received_data >= 21457280 
+            && ((test == T_MULTIPATH && !has_migrated) 
+                 || (test == T_AGGREGATION && !has_multipath)))
+            || (test == T_AGGREGATION_TIME && !has_multipath && diff.tv_sec >= 5)) {
       if (test == T_MULTIPATH)
         has_migrated = 1;
       else
@@ -867,6 +880,7 @@ static int handle_client_connection(tcpls_t *tcpls, struct cli_data *data,
     case T_MULTIPATH:
     case T_AGGREGATION:
     case T_AGGREGATION_TIME:
+    case T_PERF_AGGREGATION:
       {
         struct timeval timeout;
         timeout.tv_sec = 5;
@@ -877,13 +891,12 @@ static int handle_client_connection(tcpls_t *tcpls, struct cli_data *data,
           fprintf(stderr, "tcpls_connect failed with err %d\n", err);
           return 1;
         }
-        if (test == T_MULTIPATH || test == T_AGGREGATION  || test == T_AGGREGATION_TIME){
+        if (test == T_MULTIPATH || test == T_AGGREGATION  
+           || test == T_AGGREGATION_TIME || test == T_PERF_AGGREGATION
+           || tcpls->enable_failover){
           tcpls->enable_multipath = 1;
         }
-        else {
-          if (tcpls->enable_failover)
-            tcpls->enable_multipath = 1;
-        }
+        
         ret = handle_client_transfer_test(tcpls, test, data);
       }
       break;
@@ -899,7 +912,7 @@ static int handle_client_connection(tcpls_t *tcpls, struct cli_data *data,
         }
         if (tcpls->enable_failover) {
           tcpls->enable_multipath = 1;
-        }
+        } 
         ret = handle_client_perf_test(tcpls, data);
         break;
       }
@@ -928,8 +941,7 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
   ptls_buffer_init(&rbuf, "", 0);
   ptls_buffer_init(&encbuf, "", 0);
   ptls_buffer_init(&ptbuf, "", 0);
-
-
+  
   fcntl(sockfd, F_SETFL, O_NONBLOCK);
 
   if (input_file == input_file_is_benchmark) {
@@ -950,7 +962,6 @@ static int handle_connection(int sockfd, ptls_context_t *ctx, const char *server
       goto Exit;
     }
   }
-
 
   while (1) {
     /* check if data is available */
@@ -1149,9 +1160,9 @@ static int run_server(struct sockaddr_storage *sa_ours, struct sockaddr_storage
   memset(&timeout, 0, sizeof(struct timeval));
   ptls_buffer_t recvbuf;
   ptls_buffer_init(&recvbuf, "", 0);
-  int datalen_max = 16 * 16640;
-  int datalen = datalen_max;
-  uint8_t data_to_write[datalen];
+#define _datalen_max  (16 * 16640)
+  int datalen = _datalen_max;
+  uint8_t data_to_write[_datalen_max] = {0};
   int qlen = 5;
   for (int i = 0; i < nbr_ours; i++) {
     if (sa_ours[i].ss_family == AF_INET) {
@@ -1257,7 +1268,9 @@ static int run_server(struct sockaddr_storage *sa_ours, struct sockaddr_storage
             conntcpls.conn_fd = new_conn;
             conntcpls.wants_to_write = 0;
             conntcpls.tcpls = new_tcpls;
-            if (test == T_MULTIPATH || new_tcpls->enable_failover || test == T_AGGREGATION || test == T_AGGREGATION_TIME)
+            if (test == T_MULTIPATH || new_tcpls->enable_failover 
+                || test == T_AGGREGATION || test == T_AGGREGATION_TIME
+                || test == T_PERF_AGGREGATION)
               conntcpls.tcpls->enable_multipath = 1;
             list_add(tcpls_l, new_tcpls);
             /** ADD our ips  -- This might worth to be ctx and instance-based?*/
@@ -1274,17 +1287,27 @@ static int run_server(struct sockaddr_storage *sa_ours, struct sockaddr_storage
         case T_MULTIPATH:
         case T_AGGREGATION:
         case T_AGGREGATION_TIME:
+        case T_PERF_AGGREGATION:
           assert(input_file);
           if (!inputfd && (inputfd = open(input_file, O_RDONLY)) == -1) {
             fprintf(stderr, "failed to open file:%s:%s\n", input_file, strerror(errno));
             goto Exit;
           }
-          if ((ret = handle_server_multipath_test(conn_tcpls, test, &inputfd,  &readset, &writeset)) < -1) {
+          if ((ret = handle_server_multipath_test(conn_tcpls, test, &inputfd,  &readset,
+                                                 &writeset, &recvbuf, data_to_write, datalen)) < -1) {                
+            if (ret == -2) 
+               datalen = datalen/2;
+                                                 
             goto Exit;
           }
+          datalen = datalen*2;
+          if (datalen > _datalen_max)
+               datalen = _datalen_max;
+          
           break;
         case T_PERF:
-          if ((ret = handle_server_perf_test((struct conn_to_tcpls *) list_get(conn_tcpls, 0), &readset, &writeset, &recvbuf,  data_to_write, datalen)) < 1) {
+          if ((ret = handle_server_perf_test((struct conn_to_tcpls *) list_get(conn_tcpls, 0), &readset,
+                                                   &writeset, &recvbuf,  data_to_write, datalen)) < 1) {
             if (ret == -2)
               datalen = datalen/2;
             else if (ret < 0) {
@@ -1293,8 +1316,8 @@ static int run_server(struct sockaddr_storage *sa_ours, struct sockaddr_storage
             }
           }
           datalen = datalen*2;
-          if (datalen > datalen_max)
-            datalen = datalen_max;
+          if (datalen > _datalen_max)
+            datalen = _datalen_max;
           break;
         case T_ZERO_RTT_HANDSHAKE:
         case T_SIMPLE_HANDSHAKE:
@@ -1596,6 +1619,8 @@ int main(int argc, char **argv)
                   test = T_SIMPLE_TRANSFER;
                 else if (strcasecmp(optarg, "perf") == 0)
                   test = T_PERF;
+                else if (strcasecmp(optarg, "perf_aggregation") == 0)
+                  test = T_PERF_AGGREGATION;                  
                 else if (strcasecmp(optarg, "aggregation") == 0)
                   test = T_AGGREGATION;
                 else if (strcasecmp(optarg, "aggregation_time") == 0)
